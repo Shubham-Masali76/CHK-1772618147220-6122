@@ -1,11 +1,8 @@
-from sklearn.model_selection import train_test_split
-from sklearn.model_selection import cross_val_score
-
-import time
-
+from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.linear_model import LogisticRegression, LinearRegression
 from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+import time
 
 from explainability.feature_importance import get_feature_importance
 
@@ -54,42 +51,29 @@ def train_models(df, target):
 
     for name, model in models.items():
 
-        # Cross validation scoring
-        if problem_type == "classification":
-            scores = cross_val_score(model, X, y, cv=5, scoring="accuracy")
-        else:
-            scores = cross_val_score(model, X, y, cv=5, scoring="r2")
+        score = cross_val_score(model, X, y, cv=5).mean()
 
-        score = scores.mean()
-
-        # Training time tracking
         start = time.time()
-
         model.fit(X_train, y_train)
-
         end = time.time()
-
-        training_time[name] = round(end - start, 3)
 
         results[name] = score
         trained_models[name] = model
+        training_time[name] = round(end - start, 3)
 
-    # Best model selection
-    best_model_name = max(results, key=results.get)
-    best_model = trained_models[best_model_name]
+    best_name = max(results, key=results.get)
 
-    # Feature importance
-    feature_importance = get_feature_importance(best_model, X.columns)
+    best_model = trained_models[best_name]
 
-    # Model leaderboard
     leaderboard = sorted(results.items(), key=lambda x: x[1], reverse=True)
 
+    feature_importance = get_feature_importance(best_model, X.columns)
+
     return {
-        "problem_type": problem_type,
         "model_scores": results,
         "leaderboard": leaderboard,
         "training_time": training_time,
-        "best_model_name": best_model_name,
+        "best_model_name": best_name,
         "best_model": best_model,
         "feature_importance": feature_importance
     }

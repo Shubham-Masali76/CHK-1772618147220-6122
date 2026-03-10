@@ -1,16 +1,12 @@
 import pandas as pd
 
-def get_feature_importance(model, feature_names):
+def get_feature_importance(model, features):
 
     if hasattr(model, "feature_importances_"):
 
-        importance = model.feature_importances_
-
-        df = pd.DataFrame({
-            "feature": feature_names,
-            "importance": importance
-        })
-
-        return df.sort_values(by="importance", ascending=False)
+        return pd.DataFrame({
+            "feature": features,
+            "importance": model.feature_importances_
+        }).sort_values(by="importance", ascending=False)
 
     return None
