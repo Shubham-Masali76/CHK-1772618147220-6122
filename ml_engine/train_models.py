@@ -20,6 +20,10 @@ def detect_problem_type(y):
 
 def train_models(df, target):
 
+    # Ensure target column exists in the dataframe
+    if target not in df.columns:
+        raise ValueError(f"Target column '{target}' not found in the dataframe. Available columns: {list(df.columns)}")
+    
     X = df.drop(columns=[target])
     y = df[target]
 

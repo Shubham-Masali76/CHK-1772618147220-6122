@@ -1,80 +1,426 @@
-"""
-app.py  —  AutoML Studio main entry point.
-
-All concerns are separated into dedicated modules:
-  styles/theme.py          → Design tokens (T) + global CSS injection
-  auth/firebase_auth.py    → Firebase config, login_user, register_user
-  auth/session_manager.py  → Per-user session persistence (save / load)
-  auth/auth_screen.py      → Login / register UI
-"""
-
-import json
-import os
-import pickle
-
+import streamlit as st
 import pandas as pd
 import plotly.express as px
-import streamlit as st
+import os
+import io
+import json
+import pickle
+# hashlib no longer needed — Firebase handles password hashing
+import gzip
+import base64
 
-# ── Domain modules ─────────────────────────────────────────────────────────────
-from data_analysis.analyzer              import analyze_dataset
-from data_analysis.readiness             import dataset_readiness
+from data_analysis.analyzer import analyze_dataset
+from data_analysis.readiness import dataset_readiness
 
-from preprocessing.preprocessing_engine  import preprocess_data
-from preprocessing.recommendations       import recommend_preprocessing
+from preprocessing.preprocessing_engine import preprocess_data
+from preprocessing.recommendations import recommend_preprocessing
 from preprocessing.preprocessing_advisor import preprocessing_advisor
-from preprocessing.feature_selection     import remove_highly_correlated_features
+from preprocessing.feature_selection import remove_highly_correlated_features
 
-from ml_engine.train_models              import train_models, detect_problem_type
+from ml_engine.train_models import train_models, detect_problem_type
 
-from explainability.model_explainer         import explain_model_choice
+from explainability.model_explainer import explain_model_choice
 from explainability.feature_importance_plot import plot_feature_importance
 
-from export.export_model         import export_model
-from utils.pipeline_visualizer   import show_pipeline
+from export.export_model import export_model
 
-# ── App modules ────────────────────────────────────────────────────────────────
-from styles.theme         import LIGHT_THEME, DARK_THEME, inject_css
-from auth.session_manager import init_session_state, save_user_session, load_user_session
-from auth.auth_screen     import render_auth_screen
+from utils.pipeline_visualizer import show_pipeline
 
+from styles.theme import inject_css, LIGHT_THEME, DARK_THEME
 
-# ═══════════════════════════════════════════════════════════════════════════
-# PAGE CONFIG 
-# ═══════════════════════════════════════════════════════════════════════════
-
+# ─── Page Config ─────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="AutoML Studio",
+    page_title="AutoML Assistant",
     layout="wide",
     initial_sidebar_state="collapsed",
-    page_icon=None,
+    page_icon=None
 )
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SESSION STATE + AUTH GATE + DYNAMIC CSS
-# ═══════════════════════════════════════════════════════════════════════════
+# ─── Theme Setup ─────────────────────────────────────────────────────────────
+if 'theme' not in st.session_state:
+    st.session_state.theme = 'light'
 
-init_session_state()
-
-# Inject Dynamic Theme 
-# Variable
-if "theme" not in st.session_state:
-    st.session_state.theme = "dark" # Default Theme
-    
-# Assign T dynamically so Python string blocks get the right colors!
-T = DARK_THEME if st.session_state.theme == "dark" else LIGHT_THEME
+# Inject CSS based on current theme
 inject_css(st.session_state.theme)
+T = LIGHT_THEME if st.session_state.theme == 'light' else DARK_THEME
+
+# ─── Global CSS ───────────────────────────────────────────────────────────────
+# CSS is now injected via inject_css from styles/theme.py
+
+# ═════════════════════════════════════════════════════════════════════════════
+# AUTH — FIREBASE
+# ─────────────────────────────────────────────────────────────────────────────
+# Uses Firebase Authentication (Email/Password provider) via pyrebase4.
+# No user data is stored locally — Firebase handles everything.
+#
+# Setup (one-time):
+#   1. Go to https://console.firebase.google.com → create a project
+#   2. Authentication → Sign-in method → enable Email/Password
+#   3. Project Settings → General → scroll to "Your apps" → Web app → copy config
+#   4. Paste your values into FIREBASE_CONFIG below
+#   5. pip install pyrebase4
+#
+# Username UX is preserved: we store username as a display name in Firebase
+# and use <username>@automlstudio.app as the internal email — users never
+# see or type an email address.
+# ═════════════════════════════════════════════════════════════════════════════
+
+SESSIONS_DIR = "sessions"
+
+# ── Paste your Firebase project config here ───────────────────────────────────
+FIREBASE_CONFIG = {
+  "apiKey": "AIzaSyC8iVVGmR5DQ8RZzn8uU47w4jLf6-_0ANk",
+  "authDomain": "automl-assistant.firebaseapp.com",
+  "projectId": "automl-assistant",
+  "storageBucket": "automl-assistant.firebasestorage.app",
+  "messagingSenderId": "493105345729",
+  "appId": "1:493105345729:web:bc41e0ce267d521f1f9040",
+  "measurementId": "G-SBFTKXMFKH"
+};
+
+@st.cache_resource
+def _get_firebase():
+    """
+    Initialise pyrebase once and cache it for the lifetime of the app.
+    pyrebase4 requires databaseURL — we point it to a dummy placeholder
+    since we only use Firebase Auth, not the Realtime Database.
+    """
+    import pyrebase
+    config = {**FIREBASE_CONFIG, "databaseURL": f"https://{FIREBASE_CONFIG['projectId']}-default-rtdb.firebaseio.com"}
+    fb = pyrebase.initialize_app(config)
+    return fb.auth()
+
+def _to_email(username: str) -> str:
+    """Map a plain username to a deterministic internal email for Firebase."""
+    safe = "".join(c for c in username.lower() if c.isalnum() or c in "-_.")
+    return f"{safe}@automlstudio.app"
+
+def _register_user(username: str, password: str) -> tuple[bool, str]:
+    username = username.strip()
+    if not username or not password:
+        return False, "Username and password cannot be empty."
+    if len(username) < 3:
+        return False, "Username must be at least 3 characters."
+    if len(password) < 6:
+        return False, "Password must be at least 6 characters."
+    try:
+        auth = _get_firebase()
+        user = auth.create_user_with_email_and_password(_to_email(username), password)
+        # Store the display name so we can show it back to the user
+        auth.update_profile(user["idToken"], display_name=username)
+        return True, "Account created successfully."
+    except Exception as e:
+        msg = str(e)
+        if "EMAIL_EXISTS" in msg:
+            return False, "Username already exists. Please choose another."
+        if "WEAK_PASSWORD" in msg:
+            return False, "Password must be at least 6 characters."
+        return False, f"Registration failed: {msg}"
+
+def _login_user(username: str, password: str) -> tuple[bool, str]:
+    username = username.strip()
+    if not username or not password:
+        return False, "Please enter both username and password."
+    try:
+        auth = _get_firebase()
+        auth.sign_in_with_email_and_password(_to_email(username), password)
+        return True, "Login successful."
+    except Exception as e:
+        msg = str(e)
+        if "EMAIL_NOT_FOUND" in msg or "USER_NOT_FOUND" in msg:
+            return False, "No account found with that username."
+        if "INVALID_PASSWORD" in msg or "INVALID_LOGIN_CREDENTIALS" in msg:
+            return False, "Incorrect password."
+        return False, f"Login failed: {msg}"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PER-USER SESSION PERSISTENCE
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _session_path(username: str) -> str:
+    os.makedirs(SESSIONS_DIR, exist_ok=True)
+    # .pkl.gz — gzip-compressed pickle, typically 60-80 % smaller than raw pickle
+    return os.path.join(SESSIONS_DIR, f"{username}.pkl.gz")
+
+def _slim_result(result: dict) -> dict:
+    """
+    Return a lightweight copy of the result dict.
+    The full result contains EVERY trained model (Random Forest, XGBoost, SVM …).
+    We only need the best one to power the Live Prediction tester.
+    Leaderboard, scores, training times and feature importance are plain Python
+    objects and stay as-is.
+    """
+    if result is None:
+        return None
+    return {
+        "leaderboard":        result.get("leaderboard"),
+        "model_scores":       result.get("model_scores"),
+        "training_time":      result.get("training_time"),
+        "best_model_name":    result.get("best_model_name"),
+        "best_model":         result.get("best_model"),   # only the winner
+        "feature_importance": result.get("feature_importance"),
+        # intentionally omit "all_models" / any other bulky keys
+    }
+
+def _save_user_session(username: str):
+    """
+    Persist all progress to sessions/<username>.pkl.gz (gzip-compressed).
+
+    What is stored and why it stays small:
+      • df_csv          — raw CSV text, compressed well by gzip
+      • processed_df_csv— same
+      • analysis        — plain Python dict, tiny
+      • result (slim)   — only the BEST model, not every trained model
+      • preprocessing_config — small JSON-style dict
+    """
+    if not username:
+        return
+    payload = {
+        "df_csv":           st.session_state.session_df.to_csv(index=False).encode("utf-8")
+                            if st.session_state.session_df is not None else None,
+        "df_filename":      st.session_state.session_df_filename,
+        "analysis":         st.session_state.analysis,
+        "result":           _slim_result(st.session_state.result),
+        "processed_df_csv": st.session_state.processed_df.to_csv(index=False).encode("utf-8")
+                            if st.session_state.processed_df is not None else None,
+        "preprocessing_config": st.session_state.preprocessing_config,
+    }
+    try:
+        import gzip
+        with gzip.open(_session_path(username), "wb", compresslevel=6) as f:
+            pickle.dump(payload, f)
+    except Exception:
+        pass  # never crash the app on a save failure
+
+def _load_user_session(username: str):
+    """
+    Restore a previously saved session into st.session_state on login.
+    Handles both the new .pkl.gz format and the old .pkl format gracefully.
+    """
+    import gzip
+    gz_path  = _session_path(username)                              # new format
+    pkl_path = gz_path.replace(".pkl.gz", ".pkl")                   # legacy format
+
+    if os.path.exists(gz_path):
+        open_fn, path = gzip.open, gz_path
+    elif os.path.exists(pkl_path):
+        open_fn, path = open, pkl_path
+    else:
+        return  # brand-new user — nothing to restore
+
+    try:
+        with open_fn(path, "rb") as f:
+            payload = pickle.load(f)
+
+        # Restore raw dataframe
+        st.session_state.session_df = (
+            pd.read_csv(io.BytesIO(payload["df_csv"]))
+            if payload.get("df_csv") is not None else None
+        )
+        st.session_state.session_df_filename = payload.get("df_filename", "")
+
+        # Restore downstream objects
+        st.session_state.analysis    = payload.get("analysis")
+        st.session_state.result      = payload.get("result")
+
+        # Restore processed dataframe
+        st.session_state.processed_df = (
+            pd.read_csv(io.BytesIO(payload["processed_df_csv"]))
+            if payload.get("processed_df_csv") is not None else None
+        )
+
+        # Restore preprocessing config
+        st.session_state.preprocessing_config = payload.get("preprocessing_config")
+
+        # Rebuild the export reference files so Live Prediction works immediately
+        if st.session_state.session_df is not None and st.session_state.preprocessing_config:
+            os.makedirs("export", exist_ok=True)
+            st.session_state.session_df.to_csv("export/reference_data.csv", index=False)
+            with open("export/preprocessing_config.json", "w") as f:
+                json.dump(st.session_state.preprocessing_config, f)
+
+    except Exception:
+        pass  # corrupt or old session file — start fresh silently
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SESSION STATE INITIALISATION
+# ═════════════════════════════════════════════════════════════════════════════
+
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+if "username" not in st.session_state:
+    st.session_state.username = ""
+if "auth_tab" not in st.session_state:
+    st.session_state.auth_tab = "login"
+if "analysis" not in st.session_state:
+    st.session_state.analysis = None
+if "result" not in st.session_state:
+    st.session_state.result = None
+if "processed_df" not in st.session_state:
+    st.session_state.processed_df = None
+# Holds the uploaded df across logout/login cycles (populated from disk on login)
+if "session_df" not in st.session_state:
+    st.session_state.session_df = None
+if "session_df_filename" not in st.session_state:
+    st.session_state.session_df_filename = ""
+if "preprocessing_config" not in st.session_state:
+    st.session_state.preprocessing_config = None
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# AUTH SCREEN
+# ═════════════════════════════════════════════════════════════════════════════
+
+def render_auth_screen():
+    _, centre, _ = st.columns([1, 1.2, 1])
+
+    with centre:
+        st.markdown(f"""
+        <div style="text-align:center;margin-bottom:2.5rem;">
+            <div style="
+                display:inline-flex;align-items:center;justify-content:center;
+                width:56px;height:56px;
+                background:linear-gradient(135deg,{T['cyan']},{T['violet']});
+                border-radius:16px;
+                box-shadow:0 2px 8px rgba(37,99,235,0.15);
+                font-family:'IBM Plex Mono',monospace;font-weight:500;
+                font-size:1rem;color:#fff;margin-bottom:1rem;
+            ">ML</div>
+            <div style="
+                font-family:'Plus Jakarta Sans',sans-serif;font-size:2.1rem;font-weight:800;
+                color:{T['cyan']};
+                letter-spacing:-.02em;line-height:1.1;
+            ">AutoML Assistant</div>
+            <div style="color:{T['muted']};font-size:.925rem;
+                font-family:'Plus Jakarta Sans',sans-serif;margin-top:.4rem;">
+                Your personal machine learning workspace
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        tab_login_style = (
+            f"background:linear-gradient(135deg,{T['cyan_dim']},{T['violet_dim']});"
+            f"color:{T['cyan']};border:1px solid {T['cyan']}66;font-weight:700;"
+            if st.session_state.auth_tab == "login"
+            else f"background:{T['surface']};color:{T['muted']};border:1px solid {T['border']};"
+        )
+        tab_reg_style = (
+            f"background:linear-gradient(135deg,{T['cyan_dim']},{T['violet_dim']});"
+            f"color:{T['cyan']};border:1px solid {T['cyan']}66;font-weight:700;"
+            if st.session_state.auth_tab == "register"
+            else f"background:{T['surface']};color:{T['muted']};border:1px solid {T['border']};"
+        )
+
+        sw_col1, sw_col2 = st.columns(2)
+        with sw_col1:
+            if st.button("Sign In", key="switch_login", use_container_width=True):
+                st.session_state.auth_tab = "login"
+                st.rerun()
+        with sw_col2:
+            if st.button("Create Account", key="switch_register", use_container_width=True):
+                st.session_state.auth_tab = "register"
+                st.rerun()
+
+        st.markdown("<div style='height:.2rem'></div>", unsafe_allow_html=True)
+
+        # ── Login Form ────────────────────────────────────────────────────
+        if st.session_state.auth_tab == "login":
+            st.markdown(f"""
+            <div style="background:{T['card']};border:1px solid {T['border']};
+                border-radius:16px;padding:1.8rem 2rem 1.6rem;">
+                <div style="font-family:'Plus Jakarta Sans',sans-serif;font-weight:800;
+                    color:{T['text']};font-size:1.15rem;margin-bottom:1.4rem;">
+                    Welcome back
+                </div>
+            """, unsafe_allow_html=True)
+
+            login_username = st.text_input("Username", key="login_user", placeholder="Enter your username")
+            login_password = st.text_input("Password", key="login_pass", placeholder="Enter your password", type="password")
+            st.markdown("<div style='height:.5rem'></div>", unsafe_allow_html=True)
+
+            if st.button("Sign In", key="do_login", type="primary", use_container_width=True):
+                ok, msg = _login_user(login_username, login_password)
+                if ok:
+                    st.session_state.logged_in = True
+                    st.session_state.username  = login_username.strip()
+                    # ── Restore all saved progress from disk ──
+                    _load_user_session(login_username.strip())
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+            st.markdown(f"""
+                <div style="text-align:center;margin-top:1.2rem;
+                    font-family:'Plus Jakarta Sans',sans-serif;font-size:.9rem;color:{T['muted']};">
+                    No account yet?
+                    <span style="color:{T['cyan']};font-weight:600;">Use the Create Account tab above.</span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # ── Register Form ─────────────────────────────────────────────────
+        else:
+            st.markdown(f"""
+            <div style="background:{T['card']};border:1px solid {T['border']};
+                border-radius:16px;padding:1.8rem 2rem 1.6rem;">
+                <div style="font-family:'Plus Jakarta Sans',sans-serif;font-weight:800;
+                    color:{T['text']};font-size:1.15rem;margin-bottom:1.4rem;">
+                    Create your account
+                </div>
+            """, unsafe_allow_html=True)
+
+            reg_username  = st.text_input("Username", key="reg_user",  placeholder="Choose a username (min 3 chars)")
+            reg_password  = st.text_input("Password", key="reg_pass",  placeholder="Choose a password (min 6 chars)", type="password")
+            reg_password2 = st.text_input("Confirm Password", key="reg_pass2", placeholder="Re-enter your password", type="password")
+            st.markdown("<div style='height:.5rem'></div>", unsafe_allow_html=True)
+
+            if st.button("Create Account", key="do_register", type="primary", use_container_width=True):
+                if reg_password != reg_password2:
+                    st.error("Passwords do not match.")
+                else:
+                    ok, msg = _register_user(reg_username, reg_password)
+                    if ok:
+                        # Auto-login + try loading any existing session (empty for new users)
+                        st.session_state.logged_in = True
+                        st.session_state.username  = reg_username.strip()
+                        _load_user_session(reg_username.strip())
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+            st.markdown(f"""
+                <div style="text-align:center;margin-top:1.2rem;
+                    font-family:'Plus Jakarta Sans',sans-serif;font-size:.9rem;color:{T['muted']};">
+                    Already have an account?
+                    <span style="color:{T['cyan']};font-weight:600;">Use the Sign In tab above.</span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.markdown(f"""
+        <div style="text-align:center;margin-top:2rem;
+            font-family:'IBM Plex Mono',monospace;font-size:.9rem;color:{T['border']};">
+            AutoML Assistant · All rights reserved
+        </div>
+        """, unsafe_allow_html=True)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# GATE
+# ═════════════════════════════════════════════════════════════════════════════
 
 if not st.session_state.logged_in:
     render_auth_screen()
     st.stop()
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 # MAIN APP
-# ═══════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 
-hero_left, hero_right = st.columns([5, 1.5])
+hero_left, hero_right = st.columns([6, 1])
 
 with hero_left:
     st.markdown(f"""
@@ -102,21 +448,13 @@ with hero_left:
         <div>
             <div style="
                 font-family:'Plus Jakarta Sans',sans-serif; font-size:2rem; font-weight:800;
-                background:linear-gradient(90deg,{T['text']} 20%,{T['cyan']} 65%,{T['violet']} 100%);
-                -webkit-background-clip:text; -webkit-text-fill-color:transparent;
+                color:{T['cyan']};
                 line-height:1.1; letter-spacing:-.02em;
-            ">AutoML Studio</div>
+            ">AutoML Assistant</div>
             <div style="color:{T['muted']};font-size:.925rem;
                 font-family:'Plus Jakarta Sans',sans-serif;margin-top:4px;">
                 Upload a dataset · Preprocess · Train models · Explain results
             </div>
-        </div>
-        <div style="margin-left:auto;display:flex;gap:8px;align-items:center;
-            font-family:'IBM Plex Mono',monospace;font-size:.9rem;">
-            <span style="background:{T['green']}1a;border:1px solid {T['green']}44;
-                border-radius:20px;padding:4px 12px;color:{T['green']};">LIVE</span>
-            <span style="background:{T['cyan']}0d;border:1px solid {T['cyan']}30;
-                border-radius:20px;padding:4px 12px;color:{T['cyan']};">v2.0</span>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -141,28 +479,24 @@ with hero_right:
     """, unsafe_allow_html=True)
     st.markdown("<div style='height:.4rem'></div>", unsafe_allow_html=True)
 
-    # Theme Toggle & Logout Split
-    col_t, col_out = st.columns(2)
-    with col_t:
-        toggle_label = "☀️ Light" if st.session_state.theme == "dark" else "🌙 Dark"
-        if st.button(toggle_label, use_container_width=True):
-            st.session_state.theme = "light" if st.session_state.theme == "dark" else "dark"
-            st.rerun()
-            
-    with col_out:
-        if st.button("Sign Out", key="logout", use_container_width=True):
-            # ── Save all progress to disk first, THEN wipe memory ──
-            save_user_session(st.session_state.username)
-            st.session_state.logged_in             = False
-            st.session_state.username              = ""
-            st.session_state.auth_tab              = "login"
-            st.session_state.analysis              = None
-            st.session_state.result                = None
-            st.session_state.processed_df          = None
-            st.session_state.session_df            = None
-            st.session_state.session_df_filename   = ""
-            st.session_state.preprocessing_config  = None
-            st.rerun()
+    # Theme Toggle
+    if st.button(f"Toggle Theme", key="theme_toggle", use_container_width=True):
+        st.session_state.theme = 'dark' if st.session_state.theme == 'light' else 'light'
+        st.rerun()
+
+    if st.button("Sign Out", key="logout", use_container_width=True):
+        # ── Save all progress to disk first, THEN wipe memory ──
+        _save_user_session(st.session_state.username)
+        st.session_state.logged_in             = False
+        st.session_state.username              = ""
+        st.session_state.auth_tab              = "login"
+        st.session_state.analysis              = None
+        st.session_state.result                = None
+        st.session_state.processed_df          = None
+        st.session_state.session_df            = None
+        st.session_state.session_df_filename   = ""
+        st.session_state.preprocessing_config  = None
+        st.rerun()
 
 
 # ─── Upload / Resume ─────────────────────────────────────────────────────────
@@ -211,7 +545,7 @@ if st.session_state.session_df is not None:
             st.session_state.result                = None
             st.session_state.processed_df          = None
             st.session_state.preprocessing_config  = None
-            save_user_session(st.session_state.username)
+            _save_user_session(st.session_state.username)
             st.rerun()
 
 uploaded_file = st.file_uploader(
@@ -239,7 +573,7 @@ if uploaded_file is not None:
         st.session_state.result                = None
         st.session_state.processed_df          = None
         st.session_state.preprocessing_config  = None
-        save_user_session(st.session_state.username)
+        _save_user_session(st.session_state.username)
 
 elif st.session_state.session_df is not None:
     # No new upload — resume from the saved session
@@ -306,14 +640,14 @@ with tab1:
             {title}
         </div>""", unsafe_allow_html=True)
 
-    section_label("01", "Dataset Summary")
+    section_label("01", "Dataset Preview")
+    st.dataframe(df.head(), use_container_width=True)
+
+    section_label("02", "Dataset Summary")
     col1, col2, col3 = st.columns(3)
     col1.metric("Rows", f"{df.shape[0]:,}")
     col2.metric("Columns", df.shape[1])
     col3.metric("Missing Values", df.isnull().sum().sum())
-
-    section_label("02", "Dataset Preview")
-    st.dataframe(df.head(), use_container_width=True)
 
     valid_columns = [
         col for col in df.columns
@@ -377,7 +711,7 @@ with tab1:
                 )
                 fig_corr.update_layout(
                     paper_bgcolor=T["plot_paper"], plot_bgcolor=T["plot_bg"],
-                    font=dict(family="IBM Plex Mono", color=T["muted"]),
+                    font_family="IBM Plex Mono", font_color=T["muted"],
                     title_font_size=13, title_font_color=T["muted"],
                     margin=dict(l=16, r=16, t=40, b=16),
                 )
@@ -410,7 +744,7 @@ with tab2:
     step_header("01", "Analyze Your Dataset", "Click the button to scan for issues and column types")
     if st.button("Analyze Dataset"):
         st.session_state.analysis = analyze_dataset(df)
-        save_user_session(st.session_state.username)   # ← auto-save after analysis
+        _save_user_session(st.session_state.username)   # ← auto-save after analysis
 
     if st.session_state.analysis is not None:
         analysis = st.session_state.analysis
@@ -514,7 +848,7 @@ with tab2:
 
         show_pipeline()
 
-        
+       
 
         step_header("02", "Preprocessing Recommendations", "Review AI suggestions or customise each step")
         rec      = recommend_preprocessing(df)
@@ -626,8 +960,9 @@ with tab2:
                     missing_strategy=missing_option,
                     encoding=encoding_option,
                     scaling=scaling_option,
+                    target_col=target,
                 )
-                processed_df, removed_features = remove_highly_correlated_features(processed_df)
+                processed_df, removed_features = remove_highly_correlated_features(processed_df, target_col=target)
                 if removed_features:
                     st.markdown(f"""
                     <div style="color:{T['amber']};font-size:.925rem;
@@ -658,7 +993,7 @@ with tab2:
 
                 # Save config to session state and persist everything ──
                 st.session_state.preprocessing_config = config
-                save_user_session(st.session_state.username)  # ← auto-save after training
+                _save_user_session(st.session_state.username)  # ← auto-save after training
 
             st.success("Training complete! Head to the **Results & Testing** tab.")
 
@@ -816,6 +1151,7 @@ with tab3:
                         missing_strategy=saved_config["missing_strategy"],
                         encoding=saved_config["encoding"],
                         scaling=saved_config["scaling"],
+                        target_col=saved_config["target"],
                     )
                     final_processed_row = processed_combined.tail(1)
                     expected_model_columns = [
